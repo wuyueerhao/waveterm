@@ -24,7 +24,9 @@ jobs:
           REPO_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             https://api.github.com/repos/${{ github.repository }})
 
+          DEFAULT_BRANCH=$(echo "$REPO_INFO" | jq -r '.default_branch')
           IS_FORK=$(echo "$REPO_INFO" | jq -r '.fork')
+
           if [ "$IS_FORK" != "true" ]; then
             echo "❌ 当前仓库不是 Fork 仓库，无法自动检测源仓库。"
             echo "✅ 请确认你已手动 Fork 了某个上游仓库。"
@@ -33,17 +35,19 @@ jobs:
 
           UPSTREAM_FULL_NAME=$(echo "$REPO_INFO" | jq -r '.parent.full_name')
           echo "检测到源仓库（上游）: $UPSTREAM_FULL_NAME"
+          echo "当前仓库默认分支: $DEFAULT_BRANCH"
 
           echo "upstream_full_name=$UPSTREAM_FULL_NAME" >> $GITHUB_OUTPUT
           echo "target_repo=${{ github.repository }}" >> $GITHUB_OUTPUT
+          echo "default_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
 
       # ----------------------------------------------
-      # Step 2: Checkout 你的 Fork 仓库
+      # Step 2: Checkout 你的 Fork 仓库（使用自动检测的默认分支）
       # ----------------------------------------------
-      - name: Checkout your fork
+      - name: Checkout your fork (自动分支)
         uses: actions/checkout@v4
         with:
-          ref: master
+          ref: ${{ steps.repo_info.outputs.default_branch }}  # ✅ 使用自动检测的分支
           token: ${{ secrets.MY_GIT_TOKEN }}
           fetch-depth: 0
 
@@ -59,161 +63,37 @@ jobs:
         run: |
           UPSTREAM_REPO=${{ steps.repo_info.outputs.upstream_full_name }}
           echo "添加远程源仓库: $UPSTREAM_REPO"
+
+          # 获取源仓库的默认分支
+          UPSTREAM_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/$UPSTREAM_REPO)
+          UPSTREAM_DEFAULT_BRANCH=$(echo "$UPSTREAM_INFO" | jq -r '.default_branch')
+          echo "源仓库默认分支: $UPSTREAM_DEFAULT_BRANCH"
+
           git remote add upstream https://github.com/$UPSTREAM_REPO.git
+
+          # 将源仓库默认分支也输出为 GitHub Output，供后续步骤使用
+          echo "upstream_default_branch=$UPSTREAM_DEFAULT_BRANCH" >> $GITHUB_OUTPUT
 
       - name: Fetch upstream（代码 + Tags）
         run: |
+          UPSTREAM_DEFAULT_BRANCH=${{ steps.repo_info.outputs.upstream_default_branch }}
+          echo "🔁 获取源仓库代码和 Tags（分支: $UPSTREAM_DEFAULT_BRANCH）"
           git fetch upstream --tags
 
       - name: Push all tags to your fork
         run: |
           git push origin --tags
 
-      - name: Merge upstream/master
+      - name: Merge upstream/{{ steps.repo_info.outputs.upstream_default_branch }}
         run: |
-          git merge upstream/master --allow-unrelated-histories -X theirs || echo "Already up-to-date or no changes"
+          UPSTREAM_DEFAULT_BRANCH=${{ steps.repo_info.outputs.upstream_default_branch }}
+          echo "🔀 合并源仓库分支: upstream/$UPSTREAM_DEFAULT_BRANCH"
+          git merge upstream/$UPSTREAM_DEFAULT_BRANCH --allow-unrelated-histories -X theirs || echo "Already up-to-date or no changes"
 
-      - name: Push code to your fork
+      - name: Push code to your fork (当前默认分支)
         run: |
+          DEFAULT_BRANCH=${{ steps.repo_info.outputs.default_branch }}
+          echo "📤 推送代码到你的 fork（分支: $DEFAULT_BRANCH）"
           git remote set-url origin https://${{ secrets.MY_GIT_TOKEN }}@github.com/${{ github.repository }}.git
-          git push origin master
-
-      # ----------------------------------------------
-      # Step 4: 同步 Releases 和附件（完整修复版）
-      # ----------------------------------------------
-      - name: Sync Releases and Assets using GitHub API
-        env:
-          SOURCE_REPO: ${{ steps.repo_info.outputs.upstream_full_name }}
-          TARGET_REPO: ${{ steps.repo_info.outputs.target_repo }}
-          GITHUB_TOKEN: ${{ secrets.MY_GIT_TOKEN }}
-        run: |
-          echo "🔁 开始同步 Releases 和附件"
-          echo "📥 源仓库（上游）: $SOURCE_REPO"
-          echo "📤 目标仓库（你的 Fork）: $TARGET_REPO"
-
-          RELEASES=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            https://api.github.com/repos/$SOURCE_REPO/releases)
-
-          echo "$RELEASES" | jq -e 'type == "array"' >/dev/null 2>&1
-          if [ $? -ne 0 ]; then
-            echo "❌ 获取 Releases 失败，返回内容可能不是有效的数组。"
-            echo "返回内容："
-            echo "$RELEASES"
-            exit 1
-          fi
-
-          echo "$RELEASES" | jq -c '.[]' | while read -r release; do
-            TAG_NAME=$(echo "$release" | jq -r '.tag_name')
-            NAME=$(echo "$release" | jq -r '.name')
-            BODY=$(echo "$release" | jq -r '.body')
-            DRAFT=$(echo "$release" | jq -r '.draft')
-            PRERELEASE=$(echo "$release" | jq -r '.prerelease')
-            RELEASE_ID_ORIGINAL=$(echo "$release" | jq -r '.id')
-
-            echo "🔁 正在处理 Release: $NAME (Tag: $TAG_NAME)"
-
-            # 检查是否已存在该 Tag 的 Release
-            EXISTING_RELEASE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-              https://api.github.com/repos/$TARGET_REPO/releases/tags/$TAG_NAME)
-
-            if echo "$EXISTING_RELEASE" | jq -e 'has("id")' >/dev/null 2>&1; then
-              echo "✅ Release（Tag: $TAG_NAME）已存在，跳过创建。"
-            else
-              # 创建新 Release
-              RELEASE_PAYLOAD=$(jq -n \
-                --arg tag_name "$TAG_NAME" \
-                --arg name "$NAME" \
-                --arg body "$BODY" \
-                --argjson draft "$DRAFT" \
-                --argjson prerelease "$PRERELEASE" \
-                '{
-                  tag_name: $tag_name,
-                  name: $name,
-                  body: $body,
-                  draft: $draft,
-                  prerelease: $prerelease
-                }')
-
-              CREATED_RELEASE=$(curl -X POST \
-                -H "Authorization: token $GITHUB_TOKEN" \
-                -H "Accept: application/vnd.github.v3+json" \
-                https://api.github.com/repos/$TARGET_REPO/releases \
-                -d "$RELEASE_PAYLOAD")
-
-              echo "📥 Raw API Response (创建 Release):"
-              echo "$CREATED_RELEASE"
-
-              if echo "$CREATED_RELEASE" | jq -e 'has("id")' >/dev/null 2>&1; then
-                echo "✅ 创建成功！Release ID: $(echo "$CREATED_RELEASE" | jq -r '.id')"
-                UPLOAD_URL=$(echo "$CREATED_RELEASE" | jq -r '.upload_url' | sed 's/{?name,label}//')
-                RELEASE_ID=$(echo "$CREATED_RELEASE" | jq -r '.id')
-
-                # 获取附件
-                ASSETS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-                  https://api.github.com/repos/$SOURCE_REPO/releases/$RELEASE_ID_ORIGINAL/assets)
-
-                echo "$ASSETS" | jq -c '.[]' | while read -r asset; do
-                  ASSET_NAME=$(echo "$asset" | jq -r '.name')
-                  ASSET_URL=$(echo "$asset" | jq -r '.url')
-                  ASSET_ID=$(echo "$asset" | jq -r '.id')
-                  CONTENT_TYPE=$(echo "$asset" | jq -r '.content_type')
-                  DOWNLOAD_URL=$(echo "$asset" | jq -r '.browser_download_url')
-
-                  echo "⬇️  正在下载附件: $ASSET_NAME"
-                  if ! curl -s -L -H "Authorization: token $GITHUB_TOKEN" \
-                       -H "Accept: application/octet-stream" \
-                       "$DOWNLOAD_URL" -o "/tmp/$ASSET_NAME"; then
-                    echo "❌ 下载失败: $ASSET_NAME"
-                    continue
-                  fi
-
-                  echo "📤 正在上传附件: $ASSET_NAME 到 Release ID $RELEASE_ID"
-                  UPLOAD_RESPONSE=$(curl -X POST \
-                    -H "Authorization: token $GITHUB_TOKEN" \
-                    -H "Content-Type: $CONTENT_TYPE" \
-                    -H "Accept: application/vnd.github.v3+json" \
-                    --data-binary @"/tmp/$ASSET_NAME" \
-                    "${UPLOAD_URL}?name=${ASSET_NAME}" 2>&1)
-
-                  echo "📤 正在上传附件: $ASSET_NAME 到 Release ID $RELEASE_ID"
-                  UPLOAD_RESPONSE=$(curl -X POST \
-                    -H "Authorization: token $GITHUB_TOKEN" \
-                    -H "Content-Type: $CONTENT_TYPE" \
-                    -H "Accept: application/vnd.github.v3+json" \
-                    --data-binary @"/tmp/$ASSET_NAME" \
-                    "${UPLOAD_URL}?name=${ASSET_NAME}" 2>&1)
-                  
-                  # 🔍 智能判断响应是否为 JSON，避免 jq 解析错误
-                  if echo "$UPLOAD_RESPONSE" | head -1 | grep -qE '^\{.*\}$|^\[.*\]$'; then
-                    # 看起来像 JSON，尝试用 jq 解析
-                    if echo "$UPLOAD_RESPONSE" | jq empty >/dev/null 2>&1; then
-                      if echo "$UPLOAD_RESPONSE" | jq -e 'has("id")' >/dev/null 2>&1; then
-                        echo "✅ 附件上传成功: $ASSET_NAME"
-                      else
-                        echo "❌ 附件上传失败: $ASSET_NAME"
-                        echo "错误详情（JSON）："
-                        echo "$UPLOAD_RESPONSE" | jq .
-                      fi
-                    else
-                      # JSON 格式无效
-                      echo "❌ 附件上传失败: $ASSET_NAME"
-                      echo "返回内容不是有效的 JSON："
-                      echo "$UPLOAD_RESPONSE"
-                    fi
-                  else
-                    # 不是 JSON，直接打印原始响应
-                    echo "❌ 附件上传失败: $ASSET_NAME"
-                    echo "返回内容（非 JSON）："
-                    echo "$UPLOAD_RESPONSE"
-                  fi
-
-                  rm -f "/tmp/$ASSET_NAME"
-                done
-              else
-                echo "❌ 创建 Release 失败，返回："
-                echo "$CREATED_RELEASE" | jq .
-              fi
-            fi
-          done
-
-          echo "🎉 所有同步流程完成！"
+          git push origin $DEFAULT_BRANCH
